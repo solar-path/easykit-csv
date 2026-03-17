@@ -1,5 +1,6 @@
 // @easykit/csv — Zero-dependency CSV library for Bun
 // Parsing, generation, and streaming with full error resilience
+// Security: L1-L5 hardened (CSV injection, prototype pollution, memory limits)
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -23,10 +24,47 @@ export interface CsvOptions {
   skipEmptyLines?: boolean;
   /** Error handling strategy (default: "throw") */
   onError?: ErrorStrategy;
+  /** L1: Sanitize formula-triggering characters in generated output (default: true) */
+  sanitizeFormulas?: boolean;
+  /** L3: Maximum rows to parse — prevents OOM on huge files (default: 1_000_000) */
+  maxRows?: number;
+  /** L3: Maximum field length in characters (default: 1_048_576 = 1MB) */
+  maxFieldLength?: number;
+  /** L3: Maximum fields per row (default: 10_000) */
+  maxFields?: number;
+  /** L3: Maximum line buffer length in streaming mode (default: 10_485_760 = 10MB) */
+  maxLineLength?: number;
 }
 
 export interface GenerateOptions extends CsvOptions {}
 export interface ParseOptions extends CsvOptions {}
+
+/** Thrown when a security limit is exceeded */
+export class CsvLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CsvLimitError";
+  }
+}
+
+// ─── Security Constants ──────────────────────────────────────────────────────
+
+/** L1: Characters that trigger formula execution in spreadsheet applications */
+const FORMULA_PREFIXES = new Set(["=", "+", "-", "@", "\t", "\r"]);
+
+/** L4: Object keys that could cause prototype pollution */
+const DANGEROUS_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  "toString",
+  "valueOf",
+  "hasOwnProperty",
+  "__defineGetter__",
+  "__defineSetter__",
+  "__lookupGetter__",
+  "__lookupSetter__",
+]);
 
 // ─── Defaults ────────────────────────────────────────────────────────────────
 
@@ -39,6 +77,11 @@ const DEFAULTS = {
   lineTerminator: "\n",
   skipEmptyLines: true,
   onError: "throw" as ErrorStrategy,
+  sanitizeFormulas: true,
+  maxRows: 1_000_000,
+  maxFieldLength: 1_048_576,
+  maxFields: 10_000,
+  maxLineLength: 10_485_760,
 } satisfies Required<CsvOptions>;
 
 function resolveOptions<T extends CsvOptions>(opts?: T): Required<CsvOptions> {
@@ -53,21 +96,48 @@ function handleError(strategy: ErrorStrategy, error: Error, rowIndex: number): v
   // "skip" — silently ignore
 }
 
+// ─── Security Helpers ────────────────────────────────────────────────────────
+
+/** L1: Sanitize field value to prevent CSV injection / formula execution */
+function sanitizeFormula(value: string): string {
+  if (value.length === 0) return value;
+  const firstChar = value[0]!;
+  if (FORMULA_PREFIXES.has(firstChar)) {
+    return "'" + value;
+  }
+  return value;
+}
+
+/** L4: Sanitize header key to prevent prototype pollution */
+function sanitizeKey(key: string): string {
+  if (DANGEROUS_KEYS.has(key)) {
+    return "_" + key;
+  }
+  return key;
+}
+
 // ─── Quoting ─────────────────────────────────────────────────────────────────
 
-function quoteField(value: string, delimiter: string, quoting: QuoteStrategy, escapeChar: string, lineTerminator: string): string {
-  if (quoting === "none") return value;
+function quoteField(value: string, delimiter: string, quoting: QuoteStrategy, escapeChar: string, lineTerminator: string, sanitize: boolean): string {
+  let val = value;
+
+  // L1: Sanitize formula-triggering prefixes
+  if (sanitize) {
+    val = sanitizeFormula(val);
+  }
+
+  if (quoting === "none") return val;
 
   const needsQuoting =
     quoting === "all" ||
-    value.includes(delimiter) ||
-    value.includes('"') ||
-    value.includes(lineTerminator) ||
-    value.includes("\r");
+    val.includes(delimiter) ||
+    val.includes('"') ||
+    val.includes(lineTerminator) ||
+    val.includes("\r");
 
-  if (!needsQuoting) return value;
+  if (!needsQuoting) return val;
 
-  const escaped = value.replaceAll('"', escapeChar + '"');
+  const escaped = val.replaceAll('"', escapeChar + '"');
   return `"${escaped}"`;
 }
 
@@ -99,7 +169,7 @@ export function generateCsv(data: Record<string, unknown>[], options?: GenerateO
   if (headers) {
     lines.push(
       headers
-        .map((h) => quoteField(h, opts.delimiter, opts.quoting, opts.escapeChar, opts.lineTerminator))
+        .map((h) => quoteField(h, opts.delimiter, opts.quoting, opts.escapeChar, opts.lineTerminator, opts.sanitizeFormulas))
         .join(opts.delimiter)
     );
   }
@@ -110,7 +180,7 @@ export function generateCsv(data: Record<string, unknown>[], options?: GenerateO
       const keys = headers ?? Object.keys(row);
       const values = keys.map((key) => {
         const raw = stringifyValue(row[key]);
-        return quoteField(raw, opts.delimiter, opts.quoting, opts.escapeChar, opts.lineTerminator);
+        return quoteField(raw, opts.delimiter, opts.quoting, opts.escapeChar, opts.lineTerminator, opts.sanitizeFormulas);
       });
       lines.push(values.join(opts.delimiter));
     } catch (err: unknown) {
@@ -149,7 +219,7 @@ export function generateCsvStream(
             if (headers) {
               controller.enqueue(
                 headers
-                  .map((h) => quoteField(h, opts.delimiter, opts.quoting, opts.escapeChar, opts.lineTerminator))
+                  .map((h) => quoteField(h, opts.delimiter, opts.quoting, opts.escapeChar, opts.lineTerminator, opts.sanitizeFormulas))
                   .join(opts.delimiter) + opts.lineTerminator
               );
             }
@@ -160,7 +230,7 @@ export function generateCsvStream(
             const keys = headers ?? Object.keys(row);
             const values = keys.map((key) => {
               const raw = stringifyValue(row[key]);
-              return quoteField(raw, opts.delimiter, opts.quoting, opts.escapeChar, opts.lineTerminator);
+              return quoteField(raw, opts.delimiter, opts.quoting, opts.escapeChar, opts.lineTerminator, opts.sanitizeFormulas);
             });
             controller.enqueue(values.join(opts.delimiter) + opts.lineTerminator);
           } catch (err: unknown) {
@@ -202,8 +272,9 @@ function detectDelimiter(firstLine: string): string {
 /**
  * Parse a single CSV line respecting quoted fields.
  * Returns array of field values.
+ * L3: Enforces maxFields and maxFieldLength limits.
  */
-function parseLine(line: string, delimiter: string, escapeChar: string): string[] {
+function parseLine(line: string, delimiter: string, escapeChar: string, maxFields: number, maxFieldLength: number): string[] {
   const fields: string[] = [];
   let current = "";
   let inQuotes = false;
@@ -232,6 +303,11 @@ function parseLine(line: string, delimiter: string, escapeChar: string): string[
       }
       current += char;
       i++;
+
+      // L3: Field length limit
+      if (current.length > maxFieldLength) {
+        throw new CsvLimitError(`Field exceeds maximum length of ${maxFieldLength} characters`);
+      }
     } else {
       if (char === '"') {
         inQuotes = true;
@@ -242,10 +318,20 @@ function parseLine(line: string, delimiter: string, escapeChar: string): string[
         fields.push(current);
         current = "";
         i += delimiter.length;
+
+        // L3: Fields per row limit
+        if (fields.length > maxFields) {
+          throw new CsvLimitError(`Row exceeds maximum of ${maxFields} fields`);
+        }
         continue;
       }
       current += char;
       i++;
+
+      // L3: Field length limit
+      if (current.length > maxFieldLength) {
+        throw new CsvLimitError(`Field exceeds maximum length of ${maxFieldLength} characters`);
+      }
     }
   }
 
@@ -295,6 +381,25 @@ function splitLines(text: string): string[] {
 }
 
 /**
+ * L4: Build a safe row object using Object.create(null) and sanitized keys.
+ */
+function buildRow(headers: string[], fields: string[]): Record<string, string> {
+  const row: Record<string, string> = Object.create(null) as Record<string, string>;
+
+  for (let j = 0; j < headers.length; j++) {
+    const key = sanitizeKey(headers[j]!);
+    row[key] = fields[j] ?? "";
+  }
+
+  // Include extra fields beyond headers
+  for (let j = headers.length; j < fields.length; j++) {
+    row[String(j)] = fields[j]!;
+  }
+
+  return row;
+}
+
+/**
  * Parse a CSV string into an array of objects.
  */
 export function parseCsv(input: string, options?: ParseOptions): Record<string, string>[] {
@@ -316,14 +421,15 @@ export function parseCsv(input: string, options?: ParseOptions): Record<string, 
   let startIndex: number;
 
   if (Array.isArray(opts.headers)) {
-    headers = opts.headers;
+    headers = opts.headers.map(sanitizeKey);
     startIndex = 0;
   } else if (opts.headers) {
-    headers = parseLine(lines[0]!, effectiveDelimiter, opts.escapeChar).map((h) => h.trim());
+    headers = parseLine(lines[0]!, effectiveDelimiter, opts.escapeChar, opts.maxFields, opts.maxFieldLength)
+      .map((h) => sanitizeKey(h.trim()));
     startIndex = 1;
   } else {
-    // Generate numeric headers
-    const firstFields = parseLine(lines[0]!, effectiveDelimiter, opts.escapeChar);
+    // Generate numeric headers (safe — no prototype pollution risk)
+    const firstFields = parseLine(lines[0]!, effectiveDelimiter, opts.escapeChar, opts.maxFields, opts.maxFieldLength);
     headers = firstFields.map((_, i) => String(i));
     startIndex = 0;
   }
@@ -335,20 +441,15 @@ export function parseCsv(input: string, options?: ParseOptions): Record<string, 
 
     if (opts.skipEmptyLines && line.trim() === "") continue;
 
+    // L3: Row count limit
+    if (results.length >= opts.maxRows) {
+      handleError(opts.onError, new CsvLimitError(`Exceeded maximum row limit of ${opts.maxRows}`), i);
+      break;
+    }
+
     try {
-      const fields = parseLine(line, effectiveDelimiter, opts.escapeChar);
-      const row: Record<string, string> = {};
-
-      for (let j = 0; j < headers.length; j++) {
-        row[headers[j]!] = fields[j] ?? "";
-      }
-
-      // Include extra fields beyond headers
-      for (let j = headers.length; j < fields.length; j++) {
-        row[String(j)] = fields[j]!;
-      }
-
-      results.push(row);
+      const fields = parseLine(line, effectiveDelimiter, opts.escapeChar, opts.maxFields, opts.maxFieldLength);
+      results.push(buildRow(headers, fields));
     } catch (err: unknown) {
       handleError(opts.onError, err instanceof Error ? err : new Error(String(err)), i);
     }
@@ -398,6 +499,13 @@ export function parseCsvStream(
             ? chunk.slice(1)
             : chunk;
 
+          // L3: Buffer size limit
+          if (buffer.length > opts.maxLineLength) {
+            handleError(opts.onError, new CsvLimitError(`Line buffer exceeds maximum of ${opts.maxLineLength} characters`), rowIndex);
+            buffer = "";
+            continue;
+          }
+
           // Process complete lines
           const lines = splitBufferLines();
 
@@ -410,17 +518,25 @@ export function parseCsvStream(
                 : opts.delimiter;
 
               if (Array.isArray(opts.headers)) {
-                headers = opts.headers;
+                headers = opts.headers.map(sanitizeKey);
                 processLine(line, controller);
               } else if (opts.headers) {
-                headers = parseLine(line, effectiveDelimiter, opts.escapeChar).map((h) => h.trim());
+                headers = parseLine(line, effectiveDelimiter, opts.escapeChar, opts.maxFields, opts.maxFieldLength)
+                  .map((h) => sanitizeKey(h.trim()));
               } else {
-                const firstFields = parseLine(line, effectiveDelimiter, opts.escapeChar);
+                const firstFields = parseLine(line, effectiveDelimiter, opts.escapeChar, opts.maxFields, opts.maxFieldLength);
                 headers = firstFields.map((_, i) => String(i));
                 processLine(line, controller);
               }
               headersResolved = true;
               continue;
+            }
+
+            // L3: Row count limit
+            if (rowIndex >= opts.maxRows) {
+              handleError(opts.onError, new CsvLimitError(`Exceeded maximum row limit of ${opts.maxRows}`), rowIndex);
+              controller.close();
+              return;
             }
 
             processLine(line, controller);
@@ -472,18 +588,8 @@ export function parseCsvStream(
     if (!headers) return;
 
     try {
-      const fields = parseLine(line, effectiveDelimiter, opts.escapeChar);
-      const row: Record<string, string> = {};
-
-      for (let j = 0; j < headers.length; j++) {
-        row[headers[j]!] = fields[j] ?? "";
-      }
-
-      for (let j = headers.length; j < fields.length; j++) {
-        row[String(j)] = fields[j]!;
-      }
-
-      controller.enqueue(row);
+      const fields = parseLine(line, effectiveDelimiter, opts.escapeChar, opts.maxFields, opts.maxFieldLength);
+      controller.enqueue(buildRow(headers, fields));
       rowIndex++;
     } catch (err: unknown) {
       handleError(opts.onError, err instanceof Error ? err : new Error(String(err)), rowIndex);
